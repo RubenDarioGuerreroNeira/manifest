@@ -2773,6 +2773,136 @@ describe('ProxyService — orchestration', () => {
     });
   });
 
+  describe('fallback chain on 200 with zero token usage', () => {
+    const zeroUsageResponse = () =>
+      new Response(
+        JSON.stringify({
+          id: 'chatcmpl-empty',
+          choices: [
+            { index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' },
+          ],
+          usage: { prompt_tokens: 0, completion_tokens: 0 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+
+    const realUsageResponse = () =>
+      new Response(
+        JSON.stringify({
+          id: 'chatcmpl-ok',
+          choices: [
+            { index: 0, message: { role: 'assistant', content: 'Hi' }, finish_reason: 'stop' },
+          ],
+          usage: { prompt_tokens: 12, completion_tokens: 34 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+
+    beforeEach(() => {
+      resolveService.resolve.mockResolvedValue({
+        tier: 'standard',
+        route: route('openai', 'api_key', 'gpt-4o'),
+        fallback_routes: [route('anthropic', 'api_key', 'claude')],
+        confidence: 0.9,
+        score: 5,
+        reason: 'scored',
+      });
+    });
+
+    it('triggers the fallback chain when the primary returns 200 with 0/0 usage', async () => {
+      fallbackService.tryForwardToProvider.mockResolvedValue({
+        response: zeroUsageResponse(),
+        isGoogle: false,
+        isAnthropic: false,
+        isChatGpt: false,
+      });
+      fallbackService.tryFallbacks.mockResolvedValue({
+        success: {
+          forward: {
+            response: okResponse(),
+            isGoogle: false,
+            isAnthropic: true,
+            isChatGpt: false,
+          },
+          model: 'claude',
+          provider: 'anthropic',
+          fallbackIndex: 0,
+        },
+        failures: [],
+      } as never);
+
+      const result = await svc.proxyRequest(baseOpts());
+
+      expect(fallbackService.tryFallbacks).toHaveBeenCalled();
+      expect(result.meta.fallbackFromModel).toBe('gpt-4o');
+      expect(result.meta.provider).toBe('anthropic');
+      expect(result.forward.response.status).toBe(200);
+    });
+
+    it('does not trigger the fallback chain when the primary reports real usage', async () => {
+      fallbackService.tryForwardToProvider.mockResolvedValue({
+        response: realUsageResponse(),
+        isGoogle: false,
+        isAnthropic: false,
+        isChatGpt: false,
+      });
+
+      const result = await svc.proxyRequest(baseOpts());
+
+      expect(fallbackService.tryFallbacks).not.toHaveBeenCalled();
+      expect(result.forward.response.status).toBe(200);
+      await expect(result.forward.response.json()).resolves.toMatchObject({
+        usage: { prompt_tokens: 12, completion_tokens: 34 },
+      });
+    });
+
+    it('returns the original 200 unchanged when no fallback routes exist', async () => {
+      resolveService.resolve.mockResolvedValue({
+        tier: 'standard',
+        route: route('openai', 'api_key', 'gpt-4o'),
+        fallback_routes: null,
+        confidence: 0.9,
+        score: 5,
+        reason: 'scored',
+      });
+      fallbackService.tryForwardToProvider.mockResolvedValue({
+        response: zeroUsageResponse(),
+        isGoogle: false,
+        isAnthropic: false,
+        isChatGpt: false,
+      });
+
+      const result = await svc.proxyRequest(baseOpts());
+
+      expect(fallbackService.tryFallbacks).not.toHaveBeenCalled();
+      expect(result.forward.response.status).toBe(200);
+      await expect(result.forward.response.json()).resolves.toMatchObject({
+        usage: { prompt_tokens: 0, completion_tokens: 0 },
+      });
+    });
+
+    it('does not buffer or fallback streaming responses (stream warmup owns that path)', async () => {
+      const streamRes = new Response(new ReadableStream(), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+      fallbackService.tryForwardToProvider.mockResolvedValue({
+        response: streamRes,
+        isGoogle: false,
+        isAnthropic: false,
+        isChatGpt: false,
+      });
+      mockedPeek.mockResolvedValue({ ok: true, stream: new ReadableStream() } as never);
+
+      const result = await svc.proxyRequest(
+        baseOpts({ body: { messages: [{ role: 'user', content: 'hi' }], stream: true } }),
+      );
+
+      expect(fallbackService.tryFallbacks).not.toHaveBeenCalled();
+      expect(result.forward.response.status).toBe(200);
+    });
+  });
+
   describe('stream warmup', () => {
     beforeEach(() => {
       resolveService.resolve.mockResolvedValue({

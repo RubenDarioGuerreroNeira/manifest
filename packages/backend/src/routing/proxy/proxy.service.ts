@@ -12,7 +12,7 @@ import { XaiOauthService } from '../oauth/xai/xai-oauth.service';
 import { ForwardResult } from './provider-client';
 import { SessionMomentumService } from './session-momentum.service';
 import { LimitCheckService } from '../../notifications/services/limit-check.service';
-import { shouldTriggerFallback } from './fallback-status-codes';
+import { shouldTriggerFallback, shouldTriggerFallbackForZeroUsage } from './fallback-status-codes';
 import { Tier, TIERS, ScorerMessage } from '../../scoring/types';
 import type {
   AuthType,
@@ -59,6 +59,7 @@ import {
   type RouteCredentialDeps,
 } from './route-credentials';
 import { peekStream, STREAM_WARMUP_MS } from './stream-warmup';
+import { bufferResponseForInspection } from './stream-writer';
 import { toChatCompletionsRequest } from './responses-adapter';
 import { messagesToChatCompletionsRequest } from './anthropic-messages-adapter';
 import { effectiveRoutesForResponseMode } from '../routing-core/response-mode-guard';
@@ -676,6 +677,62 @@ export class ProxyService {
         }),
         autofix: autofixRecord,
       };
+    }
+
+    // Buffered warm-up for non-streaming 200 responses — the mirror of the
+    // stream warm-up above. Some providers (OpenRouter free-tier models are
+    // the canonical case) silently return 200 with zero token usage when
+    // rate-limited or overloaded, which the status-code check can't see.
+    // Verify the provider actually produced a completion before committing
+    // to the client, and enter the same fallback chain as an HTTP error.
+    if (forward.response.ok && !stream && !explicitModelOverride && paramMergeContext) {
+      const inspected = await bufferResponseForInspection(forward.response);
+      if (shouldTriggerFallbackForZeroUsage(inspected.usage)) {
+        // Swap in the rebuilt response: the chain records the primary failure,
+        // and if it exhausts we still hand the original (empty) 200 back to
+        // the client. The original body was never consumed (inspected through
+        // a clone), so this keeps the response handler able to parse it.
+        forward = { ...forward, response: inspected.response };
+        this.logger.warn(
+          `Non-stream warmup failed (zero usage): provider=${route.provider} model=${primaryModel}`,
+        );
+        const fallbackResult = await this.tryFallbackChain({
+          agentId,
+          tenantId,
+          resolved,
+          primaryModel,
+          forward,
+          body,
+          resolveChatBody,
+          stream,
+          sessionKey,
+          sessionCacheKey,
+          providerCacheKey,
+          sessionMomentumKey,
+          signal,
+          signatureLookup,
+          thinkingLookup,
+          apiMode,
+          paramMergeContext,
+          primaryTenantProviderId: credentials.tenantProviderId,
+          primaryKeyLabel: credentials.keyLabel,
+          startProviderAttempt,
+          credentialDashboardUrl: dashboardUrl,
+        });
+        if (fallbackResult) {
+          return {
+            ...fallbackResult,
+            meta: {
+              ...fallbackResult.meta,
+              autofixOriginalAttempt,
+              autofixOriginalProviderCallStarted,
+            },
+            autofix: autofixRecord,
+          };
+        }
+        // Chain exhausted or disabled: hand the original (empty) 200 back to
+        // the client unchanged, with the warning above on record.
+      }
     }
 
     this.recordTierIfScoring(sessionMomentumKey, resolved.tier);

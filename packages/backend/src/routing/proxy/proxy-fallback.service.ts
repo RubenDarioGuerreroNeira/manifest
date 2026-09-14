@@ -69,7 +69,8 @@ import { resolveEndpointKey } from './provider-endpoints';
 import { CopilotTokenService } from './copilot-token.service';
 import { ReasoningContentCache } from './reasoning-content-cache';
 import { buildProviderExtraHeaders } from './provider-hooks';
-import { shouldTriggerFallback } from './fallback-status-codes';
+import { shouldTriggerFallback, shouldTriggerFallbackForZeroUsage } from './fallback-status-codes';
+import { bufferResponseForInspection } from './stream-writer';
 import { inferProviderFromModelName } from '../../common/utils/provider-aliases';
 import { normalizeAnthropicShortModelId } from '../../common/utils/anthropic-model-id';
 import {
@@ -410,8 +411,52 @@ export class ProxyFallbackService {
         // The hop that failed first is still recorded when Autofix recovers it,
         // so a healed fallback keeps the same audit trail as a healed primary.
         if (retrySent) failures.push(originalFailure());
+
+        // A 200 with zero token usage is a silent upstream failure (the same
+        // OpenRouter free-tier signature the primary path checks in
+        // proxy.service), not a usable completion. Record the hop as failed and
+        // keep walking the chain — unlike a real HTTP error there is no status
+        // code to let `shouldTriggerFallback` drive the loop, so this continue
+        // is deliberate and gives a later fallback its chance too.
+        const inspected = await bufferResponseForInspection(finalForward.response);
+        if (shouldTriggerFallbackForZeroUsage(inspected.usage)) {
+          // Same 502/empty_response convention the provider client uses for
+          // empty completions, so analytics and dashboards group them together.
+          const zeroUsageErrorBody = JSON.stringify({
+            error: {
+              message: 'Upstream provider returned a 200 with zero prompt and completion tokens',
+              type: 'server_error',
+              code: 'empty_response',
+            },
+          });
+          await finalForward.attempt?.finishRecording?.(
+            recordingResponseFromText(zeroUsageErrorBody),
+          );
+          failures.push({
+            model,
+            provider,
+            fallbackIndex: i,
+            status: 502,
+            errorBody: zeroUsageErrorBody,
+            authType,
+            tenantProviderId,
+            keyLabel: providerKeyLabel,
+            attempt: finalForward.attempt,
+            providerCallStarted: finalForward.providerCallStarted,
+            ...(autofixAttempt
+              ? { autofix: autofixAttempt.record, autofixRole: retrySent ? 'retry' : 'original' }
+              : {}),
+          });
+          this.logger.warn(
+            `Fallback ${i}: zero-usage 200 from provider=${provider} model=${model} — advancing to next fallback`,
+          );
+          continue;
+        }
+
         return {
           success: {
+            // On the healthy path the original forward is returned untouched —
+            // inspection happened through a clone, so nothing was consumed.
             forward: finalForward,
             model,
             provider,

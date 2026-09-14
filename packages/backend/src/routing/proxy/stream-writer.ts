@@ -178,6 +178,55 @@ export function parseUsageObject(usage: unknown): StreamUsage | null {
   return null;
 }
 
+export interface InspectedBuffer {
+  /**
+   * Rebuilt Response carrying a replayable copy of the original body bytes.
+   * Callers only need this when they will discard the original (a zero-usage
+   * veto); on the success path the original Response is left untouched.
+   */
+  response: Response;
+  /**
+   * Usage parsed from the body's `usage` block, or null when the body isn't
+   * JSON or carries no recognized usage shape.
+   */
+  usage: StreamUsage | null;
+}
+
+/**
+ * Inspect a (non-streaming) upstream Response — e.g. its token usage —
+ * WITHOUT consuming it. Reads through a `clone()`, so the original Response
+ * stays replayable for the response handler that will later write to the
+ * client. Returns a rebuilt, replayable copy of the body bytes plus the
+ * parsed usage.
+ */
+export async function bufferResponseForInspection(response: Response): Promise<InspectedBuffer> {
+  const text = await response.clone().text();
+  let usage: StreamUsage | null = null;
+  try {
+    const body: unknown = JSON.parse(text);
+    if (body && typeof body === 'object' && !Array.isArray(body)) {
+      usage = parseUsageObject((body as Record<string, unknown>).usage);
+    }
+  } catch {
+    usage = null;
+  }
+  // Same defensive header strip the fallback chain uses when it rebuilds an
+  // upstream Response: a stale content-length/encoding would mislead the
+  // client, and transfer-encoding is not valid on a buffered body.
+  const safeHeaders = new Headers(response.headers);
+  safeHeaders.delete('content-encoding');
+  safeHeaders.delete('content-length');
+  safeHeaders.delete('transfer-encoding');
+  return {
+    response: new Response(text, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: safeHeaders,
+    }),
+    usage,
+  };
+}
+
 function readReportedCostUsd(usage: Record<string, unknown>): number | undefined {
   const direct = readNonNegativeFiniteNumber(usage.cost);
   if (direct !== undefined) return direct;

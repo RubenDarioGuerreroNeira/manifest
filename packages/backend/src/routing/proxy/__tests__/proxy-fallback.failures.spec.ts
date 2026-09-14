@@ -273,6 +273,67 @@ describe('ProxyFallbackService.tryFallbacks — failure chain by status code', (
     }
   });
 
+  it('advances past a fallback that returns 200 with zero token usage', async () => {
+    providerClient.forward
+      .mockResolvedValueOnce({
+        response: new Response(
+          JSON.stringify({
+            id: 'chatcmpl-zero',
+            choices: [
+              { index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' },
+            ],
+            usage: { prompt_tokens: 0, completion_tokens: 0 },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+        isGoogle: false,
+        isAnthropic: false,
+        isChatGpt: false,
+      })
+      .mockResolvedValueOnce({
+        response: new Response(
+          JSON.stringify({
+            id: 'chatcmpl-ok',
+            choices: [
+              {
+                index: 0,
+                message: { role: 'assistant', content: 'Recovered' },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: { prompt_tokens: 10, completion_tokens: 20 },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+        isGoogle: false,
+        isAnthropic: false,
+        isChatGpt: false,
+      });
+
+    const routes: ModelRoute[] = [
+      route('openai', 'gpt-4o-mini'),
+      route('deepseek', 'deepseek-chat'),
+    ];
+    const result = await runFallbacks(['gpt-4o-mini', 'deepseek-chat'], routes);
+
+    expect(result.success).toMatchObject({
+      fallbackIndex: 1,
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+    });
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]).toMatchObject({
+      fallbackIndex: 0,
+      provider: 'openai',
+      status: 502,
+    });
+    // Same 502/empty_response convention as the provider client's empty
+    // completion qualifier, so dashboards group both failure modes together.
+    expect(JSON.parse(result.failures[0].errorBody)).toMatchObject({
+      error: { code: 'empty_response' },
+    });
+  });
+
   it('cooldowns repeated 429 attempts for the same provider key and model', async () => {
     providerClient.forward.mockResolvedValueOnce({
       response: new Response('rate limit', {
